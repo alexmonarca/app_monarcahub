@@ -1,0 +1,6 @@
+{
+  "name": "Starter Canvas",
+  "description": "Um template limpo e moderno pronto para sincronização com o GitHub e desenvolvimento colaborativo com IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
