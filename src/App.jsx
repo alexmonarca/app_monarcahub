@@ -1934,6 +1934,13 @@ function Dashboard({ session }) {
   const [trainingFile, setTrainingFile] = useState(null);
   const [isTrainingFileSending, setIsTrainingFileSending] = useState(false);
   const [trainingFileFeedback, setTrainingFileFeedback] = useState("");
+  const [isRecordingTrain, setIsRecordingTrain] = useState(false);
+  const [mediaRecorderTrain, setMediaRecorderTrain] = useState(null);
+  const [recordingTrainSeconds, setRecordingTrainSeconds] = useState(0);
+  const [recordingTrainInterval, setRecordingTrainInterval] = useState(null);
+  const [trainAudioFeedback, setTrainAudioFeedback] = useState("");
+  const [trainAudioOutput, setTrainAudioOutput] = useState("");
+  const [isProcessingTrainAudio, setIsProcessingTrainAudio] = useState(false);
   const [isDsfitAccessLoading, setIsDsfitAccessLoading] = useState(true);
   const [hasDsfitStudentsAccess, setHasDsfitStudentsAccess] = useState(false);
   const [isDsfitAlunoSaving, setIsDsfitAlunoSaving] = useState(false);
@@ -2950,6 +2957,127 @@ function Dashboard({ session }) {
     }
   };
 
+  const startRecordingTrain = async () => {
+    try {
+      setTrainAudioFeedback("");
+      setTrainAudioOutput("");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        stream.getTracks().forEach((track) => track.stop());
+        await processTrainAudio(blob);
+      };
+
+      setMediaRecorderTrain(recorder);
+      recorder.start();
+      setIsRecordingTrain(true);
+      setRecordingTrainSeconds(0);
+
+      const interval = setInterval(() => {
+        setRecordingTrainSeconds((prev) => prev + 1);
+      }, 1000);
+      setRecordingTrainInterval(interval);
+    } catch (err) {
+      console.error("Erro ao acessar microfone para treino:", err);
+      setTrainAudioFeedback("Não foi possível acessar o microfone para gravação.");
+    }
+  };
+
+  const stopRecordingTrain = () => {
+    if (mediaRecorderTrain && isRecordingTrain) {
+      mediaRecorderTrain.stop();
+      setIsRecordingTrain(false);
+      if (recordingTrainInterval) {
+        clearInterval(recordingTrainInterval);
+        setRecordingTrainInterval(null);
+      }
+    }
+  };
+
+  const cancelRecordingTrain = () => {
+    if (mediaRecorderTrain && isRecordingTrain) {
+      mediaRecorderTrain.onstop = () => {
+        setMediaRecorderTrain(null);
+      };
+      mediaRecorderTrain.stop();
+      setIsRecordingTrain(false);
+      if (recordingTrainInterval) {
+        clearInterval(recordingTrainInterval);
+        setRecordingTrainInterval(null);
+      }
+    }
+  };
+
+  const processTrainAudio = async (audioBlob) => {
+    setIsProcessingTrainAudio(true);
+    setTrainAudioFeedback("Processando seu áudio com a Inteligência Artificial, por favor aguarde...");
+    
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "train_audio.webm");
+
+      const response = await fetch("/api/train-audio", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Erro do servidor (${response.status})`);
+      }
+
+      const data = await response.json();
+      if (data.success) {
+        setTrainAudioOutput(data.structuredText);
+        setTrainAudioFeedback("Áudio processado e regras estruturadas com sucesso! Revise e escolha onde salvar abaixo.");
+      } else {
+        throw new Error(data.error || "Erro ao processar áudio.");
+      }
+    } catch (err) {
+      console.error("Erro no processamento de áudio de treino:", err);
+      setTrainAudioFeedback(`Erro: ${err.message || "Falha ao analisar o áudio."}`);
+    } finally {
+      setIsProcessingTrainAudio(false);
+    }
+  };
+
+  const handleMergeTrainOutput = async (targetField) => {
+    if (!trainAudioOutput) return;
+
+    const currentValue = gymData[targetField] || "";
+    const newValue = currentValue 
+      ? `${currentValue}\n\n--- Treinamento por Áudio ---\n${trainAudioOutput}`
+      : trainAudioOutput;
+
+    const updatedGymData = { ...gymData, [targetField]: newValue };
+    setGymData(updatedGymData);
+
+    const saved = await handlePartialSave({ [targetField]: newValue });
+    if (saved) {
+      setTrainAudioFeedback(`As informações do áudio foram salvas com sucesso em "${getFieldLabel(targetField)}"!`);
+      setTrainAudioOutput("");
+    } else {
+      setTrainAudioFeedback("Não foi possível salvar no banco de dados. Tente atualizar a página.");
+    }
+  };
+
+  const getFieldLabel = (field) => {
+    switch (field) {
+      case "opening_hours": return "Horários";
+      case "pricing_info": return "Preços";
+      case "faq_text": return "FAQ / Regras";
+      case "observations": return "Observações";
+      default: return field;
+    }
+  };
+
   // CÁLCULO DE PREÇO (COM DESCONTO ONBOARDING)
   // Regra: cupom só aplica quando o total sem descontos for > R$ 250.
   const totalWithoutDiscounts = calculateTotal(gymData, extraChannels, gymData.extra_users_count, extraCreditsCost, 0, 0);
@@ -3929,6 +4057,103 @@ function Dashboard({ session }) {
                   {trainingFile && <p className="mt-2 text-xs text-gray-400">Arquivo selecionado: {trainingFile.name}</p>}
                   {trainingFileFeedback && <p className="mt-3 text-xs text-orange-300">{trainingFileFeedback}</p>}
                 </div>
+
+                {/* Treinar IA por Voz / Áudio */}
+                <div className="mb-6 bg-gray-900 border border-gray-700 rounded-lg p-4 animate-in fade-in">
+                  <label className="block text-sm font-medium text-gray-300 mb-2 flex items-center gap-2">
+                    <Mic className="w-4 h-4 text-orange-400" /> Treinar com sua Voz (Áudio)
+                  </label>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Grave uma explicação detalhada sobre seu negócio (regras, preços, horários) e a IA vai organizar e atualizar o cérebro do agente para você.
+                  </p>
+                  
+                  <div className="flex flex-col sm:flex-row gap-3 items-center">
+                    {isRecordingTrain ? (
+                      <div className="flex-1 flex items-center justify-between bg-red-500/10 border border-red-500/20 rounded-lg p-2.5 w-full animate-pulse">
+                        <div className="flex items-center gap-2">
+                          <span className="h-2 w-2 rounded-full bg-red-500 animate-ping" />
+                          <span className="text-red-400 text-xs font-semibold">
+                            Gravando sua explicação: {Math.floor(recordingTrainSeconds / 60)}:{String(recordingTrainSeconds % 60).padStart(2, "0")}
+                          </span>
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={cancelRecordingTrain}
+                            className="px-2.5 py-1 text-gray-400 hover:text-red-400 transition-colors text-xs font-medium"
+                          >
+                            Cancelar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={stopRecordingTrain}
+                            className="bg-red-500 hover:bg-red-600 text-white px-3 py-1 rounded-md text-xs font-semibold transition-colors"
+                          >
+                            Parar e Enviar
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={startRecordingTrain}
+                        disabled={isProcessingTrainAudio}
+                        className="w-full sm:w-auto px-4 py-2 bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 rounded-lg text-sm font-medium border border-orange-500/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                      >
+                        <Mic className="w-4 h-4" />
+                        Gravar minha Explicação
+                      </button>
+                    )}
+                  </div>
+
+                  {trainAudioFeedback && (
+                    <p className="mt-3 text-xs text-orange-300 font-medium">
+                      {trainAudioFeedback}
+                    </p>
+                  )}
+
+                  {trainAudioOutput && (
+                    <div className="mt-4 p-3 bg-gray-950 border border-gray-800 rounded-lg animate-in fade-in">
+                      <h5 className="text-xs font-semibold text-gray-300 mb-2">Informações Extraídas pela IA:</h5>
+                      <textarea
+                        value={trainAudioOutput}
+                        onChange={(e) => setTrainAudioOutput(e.target.value)}
+                        className="w-full h-36 bg-transparent text-gray-300 border-0 outline-none resize-none text-xs font-mono p-1 leading-relaxed focus:ring-0"
+                      />
+                      <div className="mt-3 pt-2 border-t border-gray-800/60 flex flex-wrap gap-2 justify-end">
+                        <button
+                          type="button"
+                          onClick={() => handleMergeTrainOutput("opening_hours")}
+                          className="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-[10px] rounded font-semibold transition-colors"
+                        >
+                          Salvar em Horários
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleMergeTrainOutput("pricing_info")}
+                          className="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-[10px] rounded font-semibold transition-colors"
+                        >
+                          Salvar em Preços
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleMergeTrainOutput("faq_text")}
+                          className="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-[10px] rounded font-semibold transition-colors"
+                        >
+                          Salvar em FAQ/Regras
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleMergeTrainOutput("observations")}
+                          className="px-2 py-1 bg-orange-500 hover:bg-orange-600 text-white text-[10px] rounded font-semibold transition-colors"
+                        >
+                          Salvar em Observações
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 <div className="my-6 grid grid-cols-1 md:grid-cols-2 gap-4">
                   <CheckboxGroup
                     icon={PhoneCall}

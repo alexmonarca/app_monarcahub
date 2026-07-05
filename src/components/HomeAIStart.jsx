@@ -8,6 +8,7 @@ import {
   Trash2,
   ChevronDown,
   ArrowUpRight,
+  Mic,
 } from "lucide-react";
 import { supabase } from "@/lib/supabaseClient";
 import RecentConversationsTeaser from "@/components/RecentConversationsTeaser";
@@ -59,6 +60,12 @@ export default function HomeAIStart({
   const modelMenuRef = useRef(null);
 
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+
+  // Estados para Gravação de Áudio do Microfone
+  const [isRecording, setIsRecording] = useState(false);
+  const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [recordingInterval, setRecordingInterval] = useState(null);
 
   const chatBlocked = Boolean(trialExpired);
 
@@ -234,6 +241,144 @@ export default function HomeAIStart({
     }
   };
 
+  // Funções de Gravação de Áudio
+  const startRecording = async () => {
+    try {
+      setError("");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        stream.getTracks().forEach((track) => track.stop());
+        await sendAudioMessage(blob);
+      };
+
+      setMediaRecorder(recorder);
+      recorder.start();
+      setIsRecording(true);
+      setRecordingSeconds(0);
+
+      const interval = setInterval(() => {
+        setRecordingSeconds((prev) => prev + 1);
+      }, 1000);
+      setRecordingInterval(interval);
+    } catch (err) {
+      console.error("Erro ao acessar microfone:", err);
+      setError("Não foi possível acessar o microfone para gravar áudio. Verifique as permissões.");
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorder && isRecording) {
+      mediaRecorder.stop();
+      setIsRecording(false);
+      if (recordingInterval) {
+        clearInterval(recordingInterval);
+        setRecordingInterval(null);
+      }
+    }
+  };
+
+  const cancelRecording = () => {
+    if (mediaRecorder && isRecording) {
+      mediaRecorder.onstop = () => {
+        setMediaRecorder(null);
+      };
+      mediaRecorder.stop();
+      setIsRecording(false);
+      if (recordingInterval) {
+        clearInterval(recordingInterval);
+        setRecordingInterval(null);
+      }
+    }
+  };
+
+  const sendAudioMessage = async (audioBlob) => {
+    setSending(true);
+    setError("");
+
+    const tempMessageId = Date.now();
+    const userMessage = {
+      role: "user",
+      content: "🎤 [Mensagem de áudio enviada, transcrevendo...]",
+      timestamp: new Date().toISOString(),
+      id: tempMessageId,
+      audioUrl: URL.createObjectURL(audioBlob),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "recording.webm");
+      formData.append("userId", user?.id ?? "");
+      formData.append("conversationId", conversationId || "");
+      formData.append("email", user?.email ?? "");
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s para processamento multimodal
+
+      const resp = await fetch("/api/chat", {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timeoutId));
+
+      if (!resp.ok) {
+        const t = await resp.text().catch(() => "");
+        throw new Error(t || `Servidor retornou ${resp.status}`);
+      }
+
+      const data = await resp.json();
+
+      if (data.success) {
+        // Substitui a mensagem temporária com o áudio e a transcrição
+        const transcribed = `🎤 ${data.userTextTranscribed || "Mensagem de áudio"}`;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === tempMessageId
+              ? { ...m, content: transcribed }
+              : m
+          )
+        );
+
+        await persistMessage({
+          role: "user",
+          content: transcribed,
+          conversation_id: conversationId,
+        });
+
+        const assistantMessage = {
+          role: "assistant",
+          content: data.reply,
+          timestamp: new Date().toISOString(),
+        };
+
+        setMessages((prev) => [...prev, assistantMessage]);
+
+        await persistMessage({
+          role: "assistant",
+          content: data.reply,
+          conversation_id: conversationId,
+        });
+      } else {
+        throw new Error(data.error || "Erro desconhecido.");
+      }
+    } catch (e) {
+      console.error(e);
+      setMessages((prev) => prev.filter((m) => m.id !== tempMessageId));
+      setError(e?.message || "Erro ao processar mensagem de áudio.");
+    } finally {
+      setSending(false);
+    }
+  };
+
   const send = async () => {
     if (!canSend) return;
     if (chatBlocked) return;
@@ -252,11 +397,6 @@ export default function HomeAIStart({
     setMessages((prev) => [...prev, userMessage]);
 
     try {
-      if (!webhookUrl) {
-        throw new Error("Webhook não configurado.");
-      }
-
-      // 1) Salva a mensagem do usuário no seu Supabase (persistência pós-F5)
       await persistMessage({
         role: "user",
         content: userText,
@@ -264,63 +404,50 @@ export default function HomeAIStart({
       });
 
       const payload = {
-        event: "user_message",
-        source: "home_ai_start",
-        user_id: user?.id ?? null,
+        message: userText,
+        userId: user?.id ?? null,
         email: user?.email ?? null,
-        message: userText.replace(/\n/g, " "),
-        conversation_id: conversationId,
-        created_at: new Date().toISOString(),
+        conversationId: conversationId,
       };
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-      const resp = await fetch(webhookUrl, {
+      const resp = await fetch("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Accept: "application/json",
         },
-        mode: "cors",
         body: JSON.stringify(payload),
         signal: controller.signal,
       }).finally(() => clearTimeout(timeoutId));
 
       if (!resp.ok) {
         const t = await resp.text().catch(() => "");
-        throw new Error(t || `Webhook retornou ${resp.status}`);
+        throw new Error(t || `Servidor retornou status ${resp.status}`);
       }
 
-      const rawText = await resp.text();
-      const parsed = parseWebhookResponse(rawText);
-      const replyText = getReplyTextFromN8n(parsed);
+      const data = await resp.json();
 
-      const assistantMessage = {
-        role: "assistant",
-        content: replyText,
-        timestamp: new Date().toISOString(),
-      };
+      if (data.success) {
+        const assistantMessage = {
+          role: "assistant",
+          content: data.reply,
+          timestamp: new Date().toISOString(),
+        };
 
-      setMessages((prev) => [...prev, assistantMessage]);
+        setMessages((prev) => [...prev, assistantMessage]);
 
-      // 2) Salva resposta do agente também
-      await persistMessage({
-        role: "assistant",
-        content: replyText,
-        conversation_id: conversationId,
-      });
+        await persistMessage({
+          role: "assistant",
+          content: data.reply,
+          conversation_id: conversationId,
+        });
+      } else {
+        throw new Error(data.error || "Erro ao processar conversa.");
+      }
     } catch (e) {
-      const rawMessage = e?.message || "";
-
-      const friendlyMessage =
-        e?.name === "AbortError"
-          ? "A conexão com a IA demorou demais e expirou. Tente novamente em alguns instantes."
-          : rawMessage.includes("timeout exceeded when trying to connect")
-            ? "O workflow da IA não conseguiu se conectar a um serviço externo (timeout). Verifique o n8n e as credenciais/URLs usadas no fluxo."
-            : rawMessage ||
-              "Erro ao processar a resposta do agente. Verifique o nó ‘Respond to Webhook’ no n8n.";
-
+      const friendlyMessage = e?.message || "Erro ao processar a resposta da IARA.";
       setMessages((prev) => [
         ...prev,
         {
@@ -450,7 +577,7 @@ export default function HomeAIStart({
                     >
                       <div
                         className={
-                          "max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-relaxed border " +
+                          "max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-relaxed border space-y-2 " +
                           (m.isError
                             ? "bg-destructive/10 border-destructive/30 text-destructive"
                             : isUser
@@ -459,6 +586,11 @@ export default function HomeAIStart({
                         }
                       >
                         <p className="whitespace-pre-wrap">{m.content}</p>
+                        {m.audioUrl && (
+                          <div className="mt-1">
+                            <audio src={m.audioUrl} controls className="max-w-full h-8 rounded-lg filter invert dark:invert-0" />
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -476,9 +608,38 @@ export default function HomeAIStart({
               </div>
             )}
 
-            {/* Input */}
-            <div className="flex items-end gap-3">
-              <div className="flex-1">
+            {/* Input com suporte a áudio e texto */}
+            <div className="flex items-center gap-3">
+              {isRecording ? (
+                <div className="flex-1 flex items-center justify-between bg-red-500/10 border border-red-500/30 rounded-2xl px-4 py-2.5 animate-pulse">
+                  <div className="flex items-center gap-3">
+                    <span className="h-3 w-3 rounded-full bg-red-500 animate-ping" />
+                    <span className="text-red-400 font-medium text-sm">
+                      Gravando áudio... {Math.floor(recordingSeconds / 60)}:
+                      {String(recordingSeconds % 60).padStart(2, "0")}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={cancelRecording}
+                      className="p-2 text-gray-400 hover:text-red-400 transition-colors rounded-lg"
+                      title="Cancelar gravação"
+                    >
+                      <Trash2 className="w-5 h-5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={stopRecording}
+                      className="px-3 py-1.5 bg-red-500 hover:bg-red-600 text-white font-medium text-xs rounded-xl transition-colors flex items-center gap-1.5"
+                    >
+                      <span>Enviar áudio</span>
+                      <Send className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex-1">
                   <textarea
                     ref={composerRef}
                     value={input}
@@ -488,69 +649,87 @@ export default function HomeAIStart({
                       setHistoryMinimized(false);
                     }}
                     onKeyDown={(e) => {
-                    // Enter = enviar. Ctrl/Cmd + Enter = quebra de linha.
-                    if (
-                      e.key === "Enter" &&
-                      !(e.ctrlKey || e.metaKey || e.shiftKey || e.altKey)
-                    ) {
-                      e.preventDefault();
-                      if (!chatBlocked) send();
-                      return;
+                      // Enter = enviar. Ctrl/Cmd + Enter = quebra de linha.
+                      if (
+                        e.key === "Enter" &&
+                        !(e.ctrlKey || e.metaKey || e.shiftKey || e.altKey)
+                      ) {
+                        e.preventDefault();
+                        if (!chatBlocked) send();
+                        return;
+                      }
+
+                      // Garante que Ctrl/Cmd+Enter NÃO seja interpretado como envio por algum handler externo
+                      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                        e.stopPropagation();
+                      }
+                    }}
+                    onInput={(e) => {
+                      // Auto-grow simples (sem bibliotecas) quando NÃO está expandido
+                      if (composerExpanded) return;
+                      e.currentTarget.style.height = "0px";
+                      e.currentTarget.style.height = `${e.currentTarget.scrollHeight}px`;
+                    }}
+                    rows={composerExpanded ? 6 : 1}
+                    placeholder={
+                      messages.length === 0
+                        ? "Ensine tudo sobre seu negócio aqui!"
+                        : "Continue a conversa com a IARA…"
                     }
-
-                    // Garante que Ctrl/Cmd+Enter NÃO seja interpretado como envio por algum handler externo
-                    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-                      e.stopPropagation();
+                    className={
+                      "w-full bg-transparent text-foreground placeholder:text-muted-foreground/80 outline-none text-base md:text-lg resize-none leading-relaxed overflow-y-auto chat-scroll " +
+                      (composerExpanded ? "min-h-32 max-h-[46vh]" : "max-h-40")
                     }
-                  }}
-                  onInput={(e) => {
-                    // Auto-grow simples (sem bibliotecas) quando NÃO está expandido
-                    if (composerExpanded) return;
-                    e.currentTarget.style.height = "0px";
-                    e.currentTarget.style.height = `${e.currentTarget.scrollHeight}px`;
-                  }}
-                  rows={composerExpanded ? 6 : 1}
-                  placeholder={
-                    messages.length === 0
-                      ? "Ensine tudo sobre seu negócio aqui!"
-                      : "Continue a conversa com a IARA…"
-                  }
-                  className={
-                    "w-full bg-transparent text-foreground placeholder:text-muted-foreground/80 outline-none text-base md:text-lg resize-none leading-relaxed overflow-y-auto chat-scroll " +
-                    (composerExpanded ? "min-h-32 max-h-[46vh]" : "max-h-40")
-                  }
-                  aria-label="Mensagem para a IARA"
-                />
-              </div>
+                    aria-label="Mensagem para a IARA"
+                  />
+                </div>
+              )}
 
-              <button
-                type="button"
-                onClick={() => {
-                  setComposerExpanded((v) => !v);
-                  // Mantém foco no campo ao expandir/contrair
-                  setTimeout(() => composerRef.current?.focus(), 0);
-                }}
-                className="hidden sm:inline-flex items-center justify-center h-11 w-11 rounded-2xl border border-border bg-background/40 text-foreground hover:bg-background/60 transition-colors"
-                aria-label={composerExpanded ? "Fechar caixa de texto" : "Abrir caixa de texto"}
-                title={composerExpanded ? "Fechar" : "Abrir"}
-              >
-                {composerExpanded ? (
-                  <Minimize2 className="w-5 h-5" />
-                ) : (
-                  <Maximize2 className="w-5 h-5" />
-                )}
-              </button>
+              {!isRecording && (
+                <button
+                  type="button"
+                  onClick={startRecording}
+                  disabled={sending || chatBlocked}
+                  className="inline-flex items-center justify-center h-11 w-11 rounded-2xl border border-border bg-background/40 text-foreground hover:bg-background/60 transition-colors disabled:opacity-40"
+                  title="Gravar áudio com microfone"
+                  aria-label="Gravar áudio"
+                >
+                  <Mic className="w-5 h-5 text-orange-400" />
+                </button>
+              )}
 
-              <button
-                type="button"
-                onClick={send}
-                disabled={!canSend}
-                className="inline-flex items-center justify-center h-11 w-11 rounded-2xl bg-primary text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed"
-                aria-label="Enviar"
-                title={chatBlocked ? "Faça upgrade para continuar" : "Enter para enviar"}
-              >
-                <Send className="w-5 h-5" />
-              </button>
+              {!isRecording && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setComposerExpanded((v) => !v);
+                    // Mantém foco no campo ao expandir/contrair
+                    setTimeout(() => composerRef.current?.focus(), 0);
+                  }}
+                  className="hidden sm:inline-flex items-center justify-center h-11 w-11 rounded-2xl border border-border bg-background/40 text-foreground hover:bg-background/60 transition-colors"
+                  aria-label={composerExpanded ? "Fechar caixa de texto" : "Abrir caixa de texto"}
+                  title={composerExpanded ? "Fechar" : "Abrir"}
+                >
+                  {composerExpanded ? (
+                    <Minimize2 className="w-5 h-5" />
+                  ) : (
+                    <Maximize2 className="w-5 h-5" />
+                  )}
+                </button>
+              )}
+
+              {!isRecording && (
+                <button
+                  type="button"
+                  onClick={send}
+                  disabled={!canSend}
+                  className="inline-flex items-center justify-center h-11 w-11 rounded-2xl bg-primary text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed"
+                  aria-label="Enviar"
+                  title={chatBlocked ? "Faça upgrade para continuar" : "Enter para enviar"}
+                >
+                  <Send className="w-5 h-5" />
+                </button>
+              )}
             </div>
 
               <div className="mt-4 flex flex-wrap gap-2">
