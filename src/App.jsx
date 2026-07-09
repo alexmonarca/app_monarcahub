@@ -1922,6 +1922,7 @@ function Dashboard({ session }) {
 
   const [connectionStep, setConnectionStep] = useState("disconnected");
   const [connectionStatus, setConnectionStatus] = useState("disconnected");
+  const [connectingInstance, setConnectingInstance] = useState(null); // { instanceName, label, phone, type: "branch" | "main", branchId: null }
   const [instanceCode, setInstanceCode] = useState("");
   const [trialInfo, setTrialInfo] = useState({ hoursLeft: 48, status: "active", endsAt: null, source: "default" });
   const [subscriptionInfo, setSubscriptionInfo] = useState({ plan_type: "trial_7_days", status: "active" });
@@ -2213,7 +2214,7 @@ function Dashboard({ session }) {
     return normalizeQrSrc(raw);
   };
 
-  const callEvolutionManager = async (action) => {
+  const callEvolutionManager = async (action, targetInstanceName = instanceName) => {
     setIsActionLoading(true);
     try {
       const response = await fetch(WEBHOOK_EVOLUTION_URL, {
@@ -2222,7 +2223,7 @@ function Dashboard({ session }) {
         headers: { "Content-Type": "application/json" },
         // Mantém compatibilidade com o fluxo atual (action) e também envia o formato
         // esperado por alguns cenários no n8n (instance.state), ex: state = "logout".
-        body: JSON.stringify({ action, instanceName, instance: { state: action } }),
+        body: JSON.stringify({ action, instanceName: targetInstanceName, instance: { state: action } }),
       });
 
       const text = await response.text();
@@ -2237,23 +2238,41 @@ function Dashboard({ session }) {
     }
   };
 
-  const handleConnectNewNumber = async () => {
+  const handleConnectNewNumber = async (instanceInfo = null) => {
     setIsQrGenerating(true); // evita race condition com polling
     setQrCodeBase64("");
     setIsQrModalOpen(true);
 
-    const createResult = await callEvolutionManager("create");
+    let targetInstanceName = instanceName;
+    let label = "Número Principal";
+    let phone = gymData.phone;
+    let type = "main";
+    let branchId = null;
+
+    if (instanceInfo) {
+      targetInstanceName = instanceInfo.instanceName;
+      label = instanceInfo.label || "conexão";
+      phone = instanceInfo.phone;
+      type = instanceInfo.type || "main";
+      branchId = instanceInfo.branchId || null;
+    }
+
+    const connectingInfo = { instanceName: targetInstanceName, label, phone, type, branchId };
+    setConnectingInstance(connectingInfo);
+
+    const createResult = await callEvolutionManager("create", targetInstanceName);
     if (!createResult) {
       alert("Erro ao criar conexão. Tente novamente.");
       setIsQrModalOpen(false);
       setIsQrGenerating(false);
+      setConnectingInstance(null);
       return;
     }
 
     // Tenta obter o QR pelo fluxo mais direto (qr) e, se não vier, cai no status
     await new Promise((resolve) => setTimeout(resolve, 1200));
 
-    const qrResult = await callEvolutionManager("qr");
+    const qrResult = await callEvolutionManager("qr", targetInstanceName);
     const qrFromQr = extractQrBase64(qrResult);
     if (qrFromQr) {
       setQrCodeBase64(qrFromQr);
@@ -2261,46 +2280,138 @@ function Dashboard({ session }) {
       return;
     }
 
-    const statusResult = await callEvolutionManager("status");
+    const statusResult = await callEvolutionManager("status", targetInstanceName);
     const qrFromStatus = extractQrBase64(statusResult);
     if (qrFromStatus) setQrCodeBase64(qrFromStatus);
 
     setIsQrGenerating(false);
 
     // Dispara uma checagem imediata (não espera 5s) para preencher o QR assim que ele existir
-    checkEvolutionStatus();
+    checkEvolutionStatusForConnecting(connectingInfo);
   };
-  const handleRestart = async () => {
-    if (confirm("Reiniciar conexão?")) {
-      await callEvolutionManager("restart");
+
+  const handleRestart = async (instanceInfo = null) => {
+    const targetInstanceName = instanceInfo?.instanceName || instanceName;
+    const label = instanceInfo?.label || "conexão";
+    if (confirm(`Deseja reiniciar a conexão de ${label}?`)) {
+      await callEvolutionManager("restart", targetInstanceName);
       alert("Reiniciando...");
     }
   };
-  const handleLogout = async () => {
-    if (confirm("Desconectar?")) {
-      const res = await callEvolutionManager("logout");
+
+  const handleLogout = async (instanceInfo = null) => {
+    const targetInstanceName = instanceInfo?.instanceName || instanceName;
+    const label = instanceInfo?.label || "conexão";
+    if (confirm(`Deseja desconectar ${label}?`)) {
+      const res = await callEvolutionManager("logout", targetInstanceName);
       if (res) {
-        setConnectionStatus("disconnected");
-        setConnectionStep("disconnected");
-        handlePartialSave({ connection_status: "disconnected", ai_active: false });
-        alert("Desconectado.");
+        if (!instanceInfo || instanceInfo.type === "main") {
+          setConnectionStatus("disconnected");
+          setConnectionStep("disconnected");
+          setGymData((prev) => ({ ...prev, connection_status: "disconnected", ai_active: false }));
+          handlePartialSave({ connection_status: "disconnected", ai_active: false });
+        } else if (instanceInfo.type === "branch" && instanceInfo.branchId) {
+          const updatedBranches = gymData.branches.map((b) =>
+            b.id === instanceInfo.branchId ? { ...b, connection_status: "disconnected" } : b
+          );
+          setGymData((prev) => ({ ...prev, branches: updatedBranches }));
+          handlePartialSave({ branches: updatedBranches });
+        }
+        alert("Desconectado com sucesso.");
+      } else {
+        alert("Não foi possível enviar o comando de desconexão.");
       }
     }
   };
-  const handleManualCheck = async () => {
-    const res = await callEvolutionManager("status");
-    if (res && (res.status === "open" || res.status === "connected")) {
-      setConnectionStatus("connected");
-      setConnectionStep("connected");
-      handlePartialSave({ connection_status: "connected" });
+
+  const handleManualCheck = async (instanceInfo = null) => {
+    const targetInstanceName = instanceInfo?.instanceName || instanceName;
+    const res = await callEvolutionManager("status", targetInstanceName);
+    const isConnected = res && (res.status === "open" || res.status === "connected");
+    
+    if (isConnected) {
+      if (!instanceInfo || instanceInfo.type === "main") {
+        setConnectionStatus("connected");
+        setConnectionStep("connected");
+        setGymData((prev) => ({ ...prev, connection_status: "connected" }));
+        handlePartialSave({ connection_status: "connected" });
+      } else if (instanceInfo.type === "branch" && instanceInfo.branchId) {
+        const updatedBranches = gymData.branches.map((b) =>
+          b.id === instanceInfo.branchId ? { ...b, connection_status: "connected" } : b
+        );
+        setGymData((prev) => ({ ...prev, branches: updatedBranches }));
+        handlePartialSave({ branches: updatedBranches });
+      }
       alert("Conectado! 🟢");
     } else {
-      setConnectionStatus("disconnected");
-      setConnectionStep("disconnected");
+      if (!instanceInfo || instanceInfo.type === "main") {
+        setConnectionStatus("disconnected");
+        setConnectionStep("disconnected");
+        setGymData((prev) => ({ ...prev, connection_status: "disconnected" }));
+        handlePartialSave({ connection_status: "disconnected" });
+      } else if (instanceInfo.type === "branch" && instanceInfo.branchId) {
+        const updatedBranches = gymData.branches.map((b) =>
+          b.id === instanceInfo.branchId ? { ...b, connection_status: "disconnected" } : b
+        );
+        setGymData((prev) => ({ ...prev, branches: updatedBranches }));
+        handlePartialSave({ branches: updatedBranches });
+      }
       alert("Desconectado 🔴");
     }
   };
+
+  const checkEvolutionStatusForConnecting = async (connectingInfo) => {
+    try {
+      const response = await fetch(WEBHOOK_EVOLUTION_URL, {
+        method: "POST",
+        mode: "cors",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "status", instanceName: connectingInfo.instanceName }),
+      });
+
+      const text = await response.text();
+      if (!text) return;
+
+      const data = JSON.parse(text);
+
+      const rawBase64 = data?.base64 ?? data?.body?.base64;
+      if (isQrModalOpen && rawBase64) {
+        const normalized = String(rawBase64).startsWith("data:image")
+          ? String(rawBase64)
+          : `data:image/png;base64,${rawBase64}`;
+        setQrCodeBase64(normalized);
+      }
+
+      if (data.status === "open" || data.status === "connected") {
+        if (connectingInfo.type === "main") {
+          setConnectionStatus("connected");
+          setConnectionStep("connected");
+          setGymData((prev) => ({ ...prev, connection_status: "connected" }));
+          handlePartialSave({ connection_status: "connected" });
+        } else if (connectingInfo.type === "branch" && connectingInfo.branchId) {
+          const updatedBranches = gymData.branches.map((b) =>
+            b.id === connectingInfo.branchId ? { ...b, connection_status: "connected" } : b
+          );
+          setGymData((prev) => ({ ...prev, branches: updatedBranches }));
+          handlePartialSave({ branches: updatedBranches });
+        }
+        if (isQrModalOpen) {
+          setTimeout(() => {
+            setIsQrModalOpen(false);
+            setConnectingInstance(null);
+          }, 2000);
+        }
+      }
+    } catch (e) {
+      // silencioso
+    }
+  };
+
   const checkEvolutionStatus = async () => {
+    if (connectingInstance) {
+      await checkEvolutionStatusForConnecting(connectingInstance);
+      return;
+    }
     try {
       const response = await fetch(WEBHOOK_EVOLUTION_URL, {
         method: "POST",
@@ -2314,9 +2425,8 @@ function Dashboard({ session }) {
 
       const data = JSON.parse(text);
 
-      // Alguns fluxos retornam o QR (base64) também no status.
       const rawBase64 = data?.base64 ?? data?.body?.base64;
-      if (isQrModalOpen && connectionStatus !== "connected" && rawBase64) {
+      if (isQrModalOpen && rawBase64) {
         const normalized = String(rawBase64).startsWith("data:image")
           ? String(rawBase64)
           : `data:image/png;base64,${rawBase64}`;
@@ -2326,20 +2436,37 @@ function Dashboard({ session }) {
       if (data.status === "open" || data.status === "connected") {
         setConnectionStatus("connected");
         setConnectionStep("connected");
-        if (isQrModalOpen) setTimeout(() => setIsQrModalOpen(false), 2000);
+        setGymData((prev) => ({ ...prev, connection_status: "connected" }));
+        if (isQrModalOpen) {
+          setTimeout(() => {
+            setIsQrModalOpen(false);
+            setConnectingInstance(null);
+          }, 2000);
+        }
         handlePartialSave({ connection_status: "connected" });
       }
     } catch (e) {
       // silencioso
     }
   };
+
   useEffect(() => {
     let interval;
-    if (((activeTab === "dashboard" && connectionStatus !== "connected") || isQrModalOpen) && !isQrGenerating) {
-      interval = setInterval(() => checkEvolutionStatus(), 5000);
+    const currentStatus = connectingInstance
+      ? (connectingInstance.type === "main" ? connectionStatus : (gymData.branches.find((b) => b.id === connectingInstance.branchId)?.connection_status || "disconnected"))
+      : connectionStatus;
+
+    if (((activeTab === "connections" || activeTab === "dashboard") && currentStatus !== "connected" || isQrModalOpen) && !isQrGenerating) {
+      interval = setInterval(() => {
+        if (connectingInstance) {
+          checkEvolutionStatusForConnecting(connectingInstance);
+        } else {
+          checkEvolutionStatus();
+        }
+      }, 5000);
     }
     return () => clearInterval(interval);
-  }, [activeTab, connectionStatus, isQrModalOpen, isQrGenerating, instanceName]);
+  }, [activeTab, connectionStatus, isQrModalOpen, isQrGenerating, instanceName, connectingInstance, gymData.branches]);
   const createInstanceOnSave = async () => {
     try {
       fetch(WEBHOOK_EVOLUTION_URL, {
@@ -2641,6 +2768,8 @@ function Dashboard({ session }) {
                 id: branch?.id ?? Date.now() + index,
                 address: branch?.address ?? "",
                 phone: branch?.phone ?? "",
+                connection_status: branch?.connection_status ?? "disconnected",
+                use_official_api: branch?.use_official_api ?? false,
               }))
             : [];
           const loadedData = { ...gymData, ...data, branches: normalizedBranches, email: session.user.email };
@@ -3186,7 +3315,7 @@ function Dashboard({ session }) {
     }
   };
   const addBranch = () =>
-    setGymData((prev) => ({ ...prev, branches: [...prev.branches, { id: Date.now(), address: "", phone: "" }] }));
+    setGymData((prev) => ({ ...prev, branches: [...prev.branches, { id: Date.now(), address: "", phone: "", connection_status: "disconnected", use_official_api: false }] }));
   const updateBranch = (id, val) =>
     setGymData((prev) => ({ ...prev, branches: prev.branches.map((b) => (b.id === id ? { ...b, address: val } : b)) }));
   const updateBranchPhone = (id, val) =>
@@ -3301,7 +3430,7 @@ function Dashboard({ session }) {
   };
 
   // META EMBEDDED SIGNUP - API Oficial (WhatsApp / Instagram)
-  const handleMetaEmbeddedSignup = async ({ mode } = {}) => {
+  const handleMetaEmbeddedSignup = async ({ mode, branchId = null, phone = null } = {}) => {
     const selectedMode = mode || "both";
     const selectedConfigId =
       selectedMode === "whatsapp"
@@ -3314,7 +3443,7 @@ function Dashboard({ session }) {
     // antes de iniciar a API Oficial; caso contrário, o número pode ficar "ocupado".
     // EXCEÇÃO: no modo coexistência, NÃO desconectamos o MonarcaHub.
     const isCoexistencia = Boolean(gymData?.use_official_api_coexistencia);
-    if (!isCoexistencia && connectionStatus === "connected") {
+    if (!isCoexistencia && connectionStatus === "connected" && !branchId) {
       const proceed = confirm(
         "Para conectar via API Oficial, vamos desconectar primeiro a instância atual (MonarcaHub). Deseja continuar?",
       );
@@ -3375,7 +3504,7 @@ function Dashboard({ session }) {
           // No modo coexistência, o usuário pode ainda estar finalizando o Embedded Signup.
           // Então NÃO disparamos o webhook 'meta_connected' nem marcamos como conectado aqui.
           const isCoexistencia = Boolean(gymData?.use_official_api_coexistencia);
-          if (isCoexistencia) {
+          if (isCoexistencia && !branchId) {
             console.log("Meta login OK (coexistência). Aguardando confirmação real do Embedded Signup.");
             alert(
               "✅ Login concluído. Agora finalize o Embedded Signup e aguarde a confirmação da conexão. " +
@@ -3400,12 +3529,23 @@ function Dashboard({ session }) {
               access_token: response.authResponse.accessToken,
               code: response.authResponse.code,
               timestamp: new Date().toISOString(),
+              branch_id: branchId || null,
+              phone: phone || null,
             }),
           })
             .then((res) => {
               if (res.ok) {
                 alert("✅ Conectado com sucesso! O WhatsApp Business e/ou Instagram foram vinculados.");
-                setGymData((prev) => ({ ...prev, use_official_api: true, omnichannel: true }));
+                if (!branchId) {
+                  setGymData((prev) => ({ ...prev, use_official_api: true, omnichannel: true }));
+                  handlePartialSave({ use_official_api: true, omnichannel: true });
+                } else {
+                  const updatedBranches = gymData.branches.map((b) =>
+                    b.id === branchId ? { ...b, use_official_api: true, connection_status: "connected" } : b
+                  );
+                  setGymData((prev) => ({ ...prev, branches: updatedBranches }));
+                  handlePartialSave({ branches: updatedBranches });
+                }
               } else {
                 alert("⚠️ Conectado na Meta, mas houve um erro ao salvar. Entre em contato com o suporte.");
               }
@@ -3635,12 +3775,27 @@ function Dashboard({ session }) {
             wantsOfficialApi={Boolean(gymData.use_official_api_coexistencia || gymData.use_official_api_somente)}
             extraChannels={extraChannels}
             onOpenPlansTab={() => setActiveTab("plans")}
+            
+            // Novos props para suporte a múltiplos números e conexões
+            gymData={gymData}
+            onSaveGymData={(newData) => {
+              setGymData(newData);
+              handlePartialSave({ 
+                branches: newData.branches, 
+                phone: newData.phone,
+                use_official_api: newData.use_official_api,
+                omnichannel: newData.omnichannel
+              });
+            }}
+            instanceName={instanceName}
+            
             onOpenWhatsAppConnectUnofficial={handleConnectNewNumber}
             whatsappUnofficialStatus={connectionStatus}
             onOpenWhatsAppConnectOfficial={handleMetaEmbeddedSignup}
             whatsappOfficialStatus={gymData.use_official_api ? "connected" : "disconnected"}
             onWhatsAppDisconnect={handleLogout}
             onWhatsAppRestart={handleRestart}
+            onCheckStatus={handleManualCheck}
           />
         );
 
