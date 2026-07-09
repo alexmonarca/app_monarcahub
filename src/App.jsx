@@ -1913,7 +1913,7 @@ function Dashboard({ session }) {
 
   const handleSignOut = async () => {
     await supabaseClient.auth.signOut();
-    window.location.reload();
+    window.location.href = "/";
   };
 
   const isSuperAdmin = session.user.email.trim().toLowerCase() === SUPER_ADMIN_EMAIL.trim().toLowerCase();
